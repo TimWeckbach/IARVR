@@ -5,180 +5,205 @@ using UnityEngine.XR.Interaction.Toolkit.Locomotion.Comfort;
 using UnityEngine.XR.Interaction.Toolkit.Locomotion;
 using UnityEngine.XR.Interaction.Toolkit.Locomotion.Movement;
 
-public class DoomfistDash : LocomotionProvider 
+public class DoomfistDash : LocomotionProvider
 {
-    public InputActionReference gripAction;
-    public InputActionReference triggerAction;
+    [Header("References")]
+    public InputActionReference leftGripAction;
+    public InputActionReference leftTriggerAction;
+    public Transform leftHandTransform;
+
+    public InputActionReference rightGripAction;
+    public InputActionReference rightTriggerAction;
+    public Transform rightHandTransform;
+
     public CharacterController characterController;
     public Transform headsetTransform;
-    public Transform handTransform;
 
-
-    //Dashing
+    [Header("Dash Settings")]
     public float maxDashDistance = 50.0f;
     public float minDashDistance = 5.0f;
     public float maxChargeTime = 3.0f;
-    public float dashSpeed = 150.0f;
+    public float dashSpeed = 25.0f;
     public float minPunchSpeed = 5.0f;
-    [Range(0f, 1f)] public float blendFactor = 0.7f;
+    [Range(0f, 1f)] public float blendFactor_howMuchHeadsetDirection = 0.7f;
 
-    //Uppercut
-    public float maxUpperCutDistance = 10.0f;
+    [Header("Uppercut Settings")]
+    public float maxUpperCutDistance = 20.0f;
     public float upperCutSpeedThreshold = 5.0f;
-    public float upperCutSpeed = 25.0f;    // Speed for upward movement during uppercut
-    
 
+    [Header("Ground Slam Settings")]
+    public float slamSpeedThreshold = 5.0f;
+    public float maxSlamDistance = 20f;
 
-    //Sound
+    [Header("Audio")]
     public AudioSource audioSource;
     public AudioClip chargingSound;
     public AudioClip dashSound;
     public AudioClip upperCutSound;
-    
+    public AudioClip groundSlamSound;
 
-    private bool isCharging = false;
-    private bool isUppercutting = false;
-    private float chargeTime = 0f;
-    private Vector3 dashDirection;
-    private float dashDistanceRemaining;
-    private bool isDashing = false;
-    private Vector3 lastHandPosition;
+    [Header("Decal")]
+    public GameObject groundSlamDecal;
+
+    private struct HandState
+    {
+        public bool isCharging;
+        public bool isDashing;
+        public bool isUppercutting;
+        public bool isGroundSlamming;
+        public float chargeTime;
+        public Vector3 lastHandPosition;
+        public Vector3 moveDirection;
+        public float distanceRemaining;
+    }
+
+    private HandState leftHandState, rightHandState;
 
     void Start()
     {
-        if (headsetTransform == null)
-        {
-            Debug.LogError("No headsetTransform assigned. Assign the headset (camera) transform for look direction.");
-        }
+        if (!headsetTransform) Debug.LogError("No headsetTransform assigned.");
+        if (!audioSource) Debug.LogError("No AudioSource assigned.");
 
-        if (audioSource == null)
-        {
-            Debug.LogError("No AudioSource assigned. Please assign an AudioSource.");
-        }
-
-        lastHandPosition = handTransform.localPosition;
+        leftHandState.lastHandPosition = leftHandTransform.localPosition;
+        rightHandState.lastHandPosition = rightHandTransform.localPosition;
     }
 
     void Update()
     {
-        bool grabPressed = gripAction.action != null && gripAction.action.ReadValue<float>() > 0.5f;
-        bool triggerPressed = triggerAction.action != null && triggerAction.action.ReadValue<float>() > 0.5f;
+        HandleHand(leftGripAction, leftTriggerAction, leftHandTransform, ref leftHandState);
+        HandleHand(rightGripAction, rightTriggerAction, rightHandTransform, ref rightHandState);
 
-        Vector3 handVelocity = (handTransform.localPosition - lastHandPosition) / Time.deltaTime;
+        // Combine both hands' movement in one frame
+        Vector3 totalMove = Movement(ref leftHandState) + Movement(ref rightHandState);
+        if (totalMove.sqrMagnitude > 0.0001f) characterController.Move(totalMove);
 
-        // Detect forward dash
-        if (grabPressed && triggerPressed && !isCharging && !isDashing)
+        ApplyGravity();
+    }
+
+    void HandleHand(InputActionReference grip, InputActionReference trigger, Transform handTransform, ref HandState h)
+    {
+        bool grabPressed = (grip.action != null && grip.action.ReadValue<float>() > 0.5f);
+        bool triggerPressed = (trigger.action != null && trigger.action.ReadValue<float>() > 0.5f);
+        Vector3 handVelocity = (handTransform.localPosition - h.lastHandPosition) / Time.deltaTime;
+
+        // Charging and dash
+        if (grabPressed && triggerPressed && !h.isCharging && !AnyMovementActive(h))
+            StartCharging(ref h);
+        else if (h.isCharging && new Vector2(handVelocity.x, handVelocity.z).magnitude >= minPunchSpeed)
+            StartDash(handVelocity, ref h);
+
+        // Uppercut
+        if (!h.isUppercutting && !h.isDashing && !h.isCharging && !h.isGroundSlamming && handVelocity.y >= upperCutSpeedThreshold)
+            StartUppercut(ref h);
+
+        // Ground slam
+        if (!h.isGroundSlamming && !h.isCharging && !h.isDashing && !h.isUppercutting && handVelocity.y <= -slamSpeedThreshold)
+            StartGroundSlam(ref h);
+
+        // Charging time
+        if (h.isCharging)
         {
-            StartCharging();
+            h.chargeTime += Time.deltaTime;
+            h.chargeTime = Mathf.Clamp(h.chargeTime, 0, maxChargeTime);
         }
-        else if (isCharging && new Vector2(handVelocity.x, handVelocity.z).magnitude >= minPunchSpeed)
-        {
-            Dash();
-        }
+
+        h.lastHandPosition = handTransform.localPosition;
+    }
+
+    bool AnyMovementActive(HandState h)
+    {
+        return h.isDashing || h.isUppercutting || h.isGroundSlamming;
+    }
+
+    void StartCharging(ref HandState h)
+    {
+        h.isCharging = true;
+        h.chargeTime = 0f;
+        if (audioSource && chargingSound) audioSource.PlayOneShot(chargingSound);
+    }
+
+    void StartDash(Vector3 handVelocity, ref HandState h)
+    {
+        if (!TryStartLocomotionImmediately()) return;
+
         
-        // Detect uppercut
-        if (!isUppercutting && !isDashing && !isCharging && handVelocity.y >= upperCutSpeedThreshold)
-        {
-            StartUppercut();
-        }
-      
+        h.isCharging = false;
+        h.isDashing = true;
+        Vector3 headsetFwd = new Vector3(headsetTransform.forward.x, 0f, headsetTransform.forward.z).normalized;
+        h.moveDirection = Vector3.Lerp(handVelocity.normalized, headsetFwd, blendFactor_howMuchHeadsetDirection).normalized;
+        h.distanceRemaining = Mathf.Lerp(minDashDistance, maxDashDistance, h.chargeTime / maxChargeTime);
 
-        if (isCharging)
-        {
-            chargeTime += Time.deltaTime;
-            chargeTime = Mathf.Clamp(chargeTime, 0, maxChargeTime);
-        }
-
-        if (isDashing || isUppercutting)
-        {
-            Movement();
-        }
-
-        lastHandPosition = handTransform.localPosition;
-    }
-
-    void StartCharging()
-    {
-        isCharging = true;
-        chargeTime = 0f;
-
-        if (audioSource != null && chargingSound != null)
-        {
-            audioSource.clip = chargingSound;
-            audioSource.loop = true;
-            audioSource.volume = 0.5f;
-            audioSource.Play();
-            Debug.Log("chargingSound played");
-        }
-    }
-
-    void Dash()
-    {
-        if (!TryStartLocomotionImmediately())
-            return;
-        isCharging = false;
-        isDashing = true;
-
-        Vector3 handVelocity = (handTransform.localPosition - lastHandPosition).normalized;
-        Vector3 headsetForward = new Vector3(headsetTransform.forward.x, 0, headsetTransform.forward.z).normalized;
-
-        dashDirection = Vector3.Lerp(handVelocity, headsetForward, blendFactor).normalized;
-        dashDistanceRemaining = Mathf.Lerp(minDashDistance, maxDashDistance, chargeTime / maxChargeTime);
-
-        if (audioSource != null && audioSource.isPlaying)
-        {
+        if (audioSource && dashSound){
             audioSource.Stop();
-        }
-
-        if (audioSource != null && dashSound != null)
-        {
-            audioSource.PlayOneShot(dashSound, 1f);
-            Debug.Log("dashSound played");
-        }
+            audioSource.PlayOneShot(dashSound);
+        } 
     }
 
-    void StartUppercut()
+    void StartUppercut(ref HandState h)
     {
-        if (!TryStartLocomotionImmediately())
-            return;
-        isCharging = false;
-        isDashing = false;
-        isUppercutting = true;
+        if (!TryStartLocomotionImmediately()) return;
 
-        // Set the dash direction for the uppercut: mainly upwards with a slight(10%) forward push
-        dashDirection = new Vector3(headsetTransform.forward.x * 0.1f, 1, headsetTransform.forward.z * 0.1f).normalized;
-        dashDistanceRemaining = maxUpperCutDistance;
+        h.isCharging = false;
+        h.isDashing = false;
+        h.isUppercutting = true;
+        h.moveDirection = (new Vector3(headsetTransform.forward.x * 0.1f, 1f, headsetTransform.forward.z * 0.1f)).normalized;
+        h.distanceRemaining = maxUpperCutDistance;
 
-        if (audioSource != null && audioSource.isPlaying)
-        {
-            audioSource.Stop();
-        }
-
-        if (audioSource != null && upperCutSound != null)
-        {
-            audioSource.PlayOneShot(upperCutSound, 1f);
-            Debug.Log("upperCutSound played");
-        }
+        if (audioSource && upperCutSound) audioSource.PlayOneShot(upperCutSound);
     }
 
-
-    void Movement()
+    void StartGroundSlam(ref HandState h)
     {
+        if (!TryStartLocomotionImmediately()) return;
+
+        h.isCharging = false;
+        h.isDashing = false;
+        h.isUppercutting = false;
+        h.isGroundSlamming = true;
+        h.moveDirection = Vector3.down;
+        h.distanceRemaining = maxSlamDistance;
+
+        if (audioSource && groundSlamSound) audioSource.PlayOneShot(groundSlamSound);
+    }
+
+    // Return the movement for this frame (instead of moving the character immediately)
+    Vector3 Movement(ref HandState h)
+    {
+        if (!AnyMovementActive(h)) return Vector3.zero;
+
         float step = dashSpeed * Time.deltaTime;
-        Vector3 dashStep = dashDirection * Mathf.Min(step, dashDistanceRemaining);
-        characterController.Move(dashStep);
-        dashDistanceRemaining -= dashStep.magnitude;
+        float moveStep = Mathf.Min(step, h.distanceRemaining);
+        Vector3 movement = h.moveDirection * moveStep;
+        h.distanceRemaining -= moveStep;
 
-        if (dashDistanceRemaining <= 0.01)
+        if (h.distanceRemaining <= 0.01f)
         {
-            if (audioSource != null && audioSource.isPlaying)
-            {
-                audioSource.Stop();
-            }
             TryEndLocomotion();
-            isDashing = false;
-            isUppercutting = false;
-            isCharging = false;
+            if (h.isGroundSlamming && groundSlamDecal && characterController.isGrounded)
+            {
+                Vector3 spawnPos = characterController.transform.position;
+                spawnPos.y += 0.1f;
+                Quaternion rotation = Quaternion.Euler(90f, 0f, 0f);
+                Instantiate(groundSlamDecal, spawnPos, rotation);
+            }
+            ResetHandState(ref h);
         }
+
+        return movement;
+    }
+
+    void ResetHandState(ref HandState h)
+    {
+        h.isDashing = false;
+        h.isUppercutting = false;
+        h.isGroundSlamming = false;
+        h.isCharging = false;
+        h.distanceRemaining = 0f;
+    }
+
+    void ApplyGravity()
+    {
+        if (characterController.isGrounded) return;
+        characterController.Move(Physics.gravity * Time.deltaTime);
     }
 }
